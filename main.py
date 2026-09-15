@@ -88,7 +88,7 @@ def _init_earth_engine():
     try:
         info = json.loads(creds_raw)
 
-        # Case A: Standard Service Account JSON Key
+        # Case A: Service Account JSON Key
         if info.get("type") == "service_account" or ("private_key" in info and "client_email" in info):
             credentials = service_account.Credentials.from_service_account_info(
                 info,
@@ -98,22 +98,22 @@ def _init_earth_engine():
             print("Earth Engine initialized via Service Account.")
             return
 
-        # Case B: Local user credentials (refresh_token with its matched client_id/secret)
-        if "refresh_token" in info:
-            # Let google-auth load the full dict directly
-            credentials = Credentials.from_authorized_user_info(
-                info,
-                scopes=["https://www.googleapis.com/auth/earthengine"]
-            )
-            ee.Initialize(credentials=credentials, project=project_id)
-            print("Earth Engine initialized via User Refresh Token.")
-            return
+        # Case B: Local user credentials (gcloud / earthengine authenticate style)
+        # Write to Earth Engine's expected credentials path in the container
+        ee_dir = os.path.expanduser("~/.config/earthengine")
+        os.makedirs(ee_dir, exist_ok=True)
+        creds_file_path = os.path.join(ee_dir, "credentials")
 
-        raise ValueError(f"Unrecognized credentials format. Keys found: {list(info.keys())}")
+        with open(creds_file_path, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # ee.Initialize() will automatically pick up ~/.config/earthengine/credentials
+        # using the SDK's internal OAuth client credentials
+        ee.Initialize(project=project_id)
+        print("Earth Engine initialized successfully via user credentials file.")
 
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Earth Engine with GEE_CREDENTIALS_JSON: {e}")
-
 _init_earth_engine()
 
 # ------------------------------------------------------------------
