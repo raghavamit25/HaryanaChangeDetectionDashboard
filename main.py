@@ -50,6 +50,7 @@ except ImportError:
     sys.modules["fcntl"] = fcntl_mock
 
 import ee
+from google.oauth2.credentials import Credentials
 
 # ------------------------------------------------------------------
 # 1. Earth Engine auth — service account, NOT interactive
@@ -71,38 +72,35 @@ import ee
 GEE_PROJECT_ID = os.environ.get("GEE_PROJECT_ID", "change-detection-haryana")
 
 
-def _init_earth_engine() -> None:
-    service_account = os.environ.get("GEE_SERVICE_ACCOUNT_EMAIL")
-    key_b64 = os.environ.get("GEE_PRIVATE_KEY_JSON_B64")
+def _init_earth_engine():
+    project_id = os.environ.get("GEE_PROJECT", "change-detection-haryana")
+    creds_json = os.environ.get("GEE_CREDENTIALS_JSON")
 
-    if service_account and key_b64:
-        key_json = base64.b64decode(key_b64).decode("utf-8")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(key_json)
-            key_path = f.name
-        credentials = ee.ServiceAccountCredentials(service_account, key_path)
-        ee.Initialize(credentials, project=GEE_PROJECT_ID)
-        print(f"Earth Engine initialized with service account {service_account}")
-        return
-
-    try:
-        # Works out of the box on GCP compute with the right IAM role
-        # (Application Default Credentials), and locally if you've already
-        # run `gcloud auth application-default login`.
-        ee.Initialize(project=GEE_PROJECT_ID)
-        print("Earth Engine initialized with Application Default Credentials")
-        return
-    except Exception as adc_err:
-        if os.environ.get("GEE_ALLOW_INTERACTIVE_AUTH") == "1":
-            print(f"ADC failed ({adc_err}); falling back to interactive auth (dev only).")
-            ee.Authenticate()
-            ee.Initialize(project=GEE_PROJECT_ID)
+    if creds_json:
+        try:
+            info = json.loads(creds_json)
+            credentials = Credentials(
+                None,
+                refresh_token=info["refresh_token"],
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=info["client_id"],
+                client_secret=info["client_secret"],
+                scopes=["https://www.googleapis.com/auth/earthengine"]
+            )
+            ee.Initialize(credentials=credentials, project=project_id)
+            print("Earth Engine initialized successfully via GEE_CREDENTIALS_JSON.")
             return
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Earth Engine with GEE_CREDENTIALS_JSON: {e}")
+
+    # Fallback for local machine testing
+    try:
+        ee.Initialize(project=project_id)
+        print("Earth Engine initialized via default credentials.")
+    except Exception as exc:
         raise RuntimeError(
-            "Earth Engine auth failed. Set GEE_SERVICE_ACCOUNT_EMAIL + "
-            "GEE_PRIVATE_KEY_JSON_B64 (production), or run this locally with "
-            "GEE_ALLOW_INTERACTIVE_AUTH=1 to authenticate once as yourself."
-        ) from adc_err
+            "Earth Engine auth failed. GEE_CREDENTIALS_JSON is missing or invalid."
+        ) from exc
 
 
 _init_earth_engine()
