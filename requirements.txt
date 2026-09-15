@@ -3,3 +3,4 @@ uvicorn[standard]>=0.29
 earthengine-api>=0.1.400
 pydantic>=2.6
 google-auth
+fpdf2

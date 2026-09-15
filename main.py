@@ -1,25 +1,5 @@
 """
-Pixel Change Detection API
---------------------------
-Serves before/after Sentinel-2 imagery plus a computed change map to a
-public-facing dashboard. Designed to run unattended on a server, so it
-authenticates to Google Earth Engine with a service account rather than
-the interactive `ee.Authenticate()` flow (which needs a human + browser
-and cannot run on a headless server).
-
-Change detection logic:
-  - "urban"      -> difference in Dynamic World's 'built' class probability.
-                     Dynamic World is Google's pretrained deep-learning land
-                     cover model (a fully convolutional neural net) already
-                     served through Earth Engine at 10 m resolution, so this
-                     gives model-based urban change detection with zero
-                     training required.
-  - "vegetation" -> difference in NDVI (vegetation loss/gain, e.g. deforestation).
-  - "water"      -> difference in NDWI (waterbody loss/gain).
-
-Each mode returns: a true-color "before" image, a true-color "after" image,
-a transparent-background change-map overlay (red = decrease, green =
-increase), and area statistics in hectares.
+Pixel Change Detection API with PDF Reporting & Haryana Map Constraints
 """
 
 import os
@@ -34,13 +14,13 @@ import urllib.request
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from fpdf import FPDF
 
-# fcntl is POSIX-only; the earthengine-api imports it transitively on some
-# platforms. Mock it so the service also boots on Windows dev machines.
+# Windows mock for fcntl
 try:
     import fcntl  # noqa: F401
 except ImportError:
@@ -50,31 +30,15 @@ except ImportError:
     sys.modules["fcntl"] = fcntl_mock
 
 import ee
-from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
-
-# ------------------------------------------------------------------
-# 1. Earth Engine auth — service account, NOT interactive
-# ------------------------------------------------------------------
-# Required for anything that runs on a server for the general public:
-#   GEE_PROJECT_ID              GCP project registered for Earth Engine
-#   GEE_SERVICE_ACCOUNT_EMAIL   e.g. cd-bot@my-project.iam.gserviceaccount.com
-#   GEE_PRIVATE_KEY_JSON_B64    base64-encoded contents of the service
-#                                account's JSON key file
-#
-# On Cloud Run / GCE / Cloud Functions you can instead grant the Earth
-# Engine role to the instance's default service account and skip the key
-# entirely — ee.Initialize() will pick up Application Default Credentials.
-#
-# GEE_ALLOW_INTERACTIVE_AUTH=1 is an escape hatch for local development
-# only; it must never be set in production, since ee.Authenticate() opens
-# a browser window and blocks forever on a headless server.
 
 GEE_PROJECT_ID = os.environ.get("GEE_PROJECT_ID", "change-detection-haryana")
 
-
+# ------------------------------------------------------------------
+# 1. Earth Engine Authentication
+# ------------------------------------------------------------------
 def _init_earth_engine():
-    project_id = os.environ.get("GEE_PROJECT", "change-detection-haryana")
+    project_id = os.environ.get("GEE_PROJECT", GEE_PROJECT_ID)
     creds_raw = os.environ.get("GEE_CREDENTIALS_JSON")
 
     if not creds_raw:
@@ -88,7 +52,7 @@ def _init_earth_engine():
     try:
         info = json.loads(creds_raw)
 
-        # Case A: Service Account JSON Key
+        # Service Account JSON Key
         if info.get("type") == "service_account" or ("private_key" in info and "client_email" in info):
             credentials = service_account.Credentials.from_service_account_info(
                 info,
@@ -98,8 +62,7 @@ def _init_earth_engine():
             print("Earth Engine initialized via Service Account.")
             return
 
-        # Case B: Local user credentials (gcloud / earthengine authenticate style)
-        # Write to Earth Engine's expected credentials path in the container
+        # Local user credentials fallback
         ee_dir = os.path.expanduser("~/.config/earthengine")
         os.makedirs(ee_dir, exist_ok=True)
         creds_file_path = os.path.join(ee_dir, "credentials")
@@ -107,24 +70,21 @@ def _init_earth_engine():
         with open(creds_file_path, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-        # ee.Initialize() will automatically pick up ~/.config/earthengine/credentials
-        # using the SDK's internal OAuth client credentials
         ee.Initialize(project=project_id)
         print("Earth Engine initialized successfully via user credentials file.")
 
     except Exception as e:
-        raise RuntimeError(f"Failed to initialize Earth Engine with GEE_CREDENTIALS_JSON: {e}")
+        raise RuntimeError(f"Failed to initialize Earth Engine: {e}")
+
 _init_earth_engine()
 
 # ------------------------------------------------------------------
-# 2. FastAPI app
+# 2. FastAPI Config & Models
 # ------------------------------------------------------------------
-app = FastAPI(title="Pixel Change Detection Engine")
+app = FastAPI(title="Haryana Change Detection Engine")
 
 app.add_middleware(
     CORSMiddleware,
-    # Lock this down to your dashboard's real domain before going live —
-    # "*" is fine for local development only.
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
@@ -133,39 +93,32 @@ app.add_middleware(
 
 ChangeType = Literal["urban", "vegetation", "water"]
 
-
 class ChangeRequest(BaseModel):
     aoi: list = Field(..., description="Closed ring of [lng, lat] pairs")
     startDate: str
     endDate: str
     changeType: ChangeType = "urban"
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "aoi": [[76.9, 28.4], [77.1, 28.4], [77.1, 28.6], [76.9, 28.6], [76.9, 28.4]],
-                "startDate": "2019-01-01",
-                "endDate": "2024-01-01",
-                "changeType": "urban",
-            }
-        }
+class ReportRequest(BaseModel):
+    startDate: str
+    endDate: str
+    changeType: str
+    indexLabel: str
+    stats: dict
+    imgBefore: str
+    imgAfter: str
+    changeOverlay: str
 
-
-# Per-index defaults: which bands to diff, how big a change has to be
-# before it counts (filters out normal seasonal / sensor noise), and the
-# thumbnail dimension used for the two RGB previews.
 INDEX_CONFIG = {
-    "urban": {"threshold": 0.30, "label": "built-up probability"},
+    "urban": {"threshold": 0.30, "label": "Built-up Probability (Dynamic World)"},
     "vegetation": {"threshold": 0.15, "label": "NDVI"},
     "water": {"threshold": 0.15, "label": "NDWI"},
 }
 
 THUMB_DIMENSIONS = 1024
-MAX_AOI_AREA_KM2 = 3000  # keep public requests fast and within GEE quotas
+MAX_AOI_AREA_KM2 = 5000
 CACHE_TTL_SECONDS = 6 * 3600
-
 _cache: dict[str, tuple[float, dict]] = {}
-
 
 def _cache_key(payload: ChangeRequest) -> str:
     raw = json.dumps(
@@ -174,13 +127,10 @@ def _cache_key(payload: ChangeRequest) -> str:
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 
-
 # ------------------------------------------------------------------
-# 3. Earth Engine helpers (all synchronous — run via asyncio.to_thread)
+# 3. GEE Image Computation
 # ------------------------------------------------------------------
 def _safe_mean(collection: "ee.ImageCollection", band: str) -> "ee.Image":
-    """Mean of `band` over a collection, or an all-zero fallback image if
-    the collection is empty (e.g. no Dynamic World coverage for a date/AOI)."""
     count = collection.size()
     return ee.Image(
         ee.Algorithms.If(
@@ -189,7 +139,6 @@ def _safe_mean(collection: "ee.ImageCollection", band: str) -> "ee.Image":
             ee.Image.constant(0).rename(band),
         )
     )
-
 
 def _s2_collection(geometry: "ee.Geometry", target_date: str, window_days: int = 15):
     start = ee.Date(target_date).advance(-window_days, "day")
@@ -201,7 +150,6 @@ def _s2_collection(geometry: "ee.Geometry", target_date: str, window_days: int =
     )
     filtered = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
     return ee.ImageCollection(ee.Algorithms.If(filtered.size().gt(0), filtered, col)), start, end
-
 
 def _composite_and_index(geometry: "ee.Geometry", target_date: str, change_type: ChangeType):
     s2_col, start, end = _s2_collection(geometry, target_date)
@@ -221,7 +169,6 @@ def _composite_and_index(geometry: "ee.Geometry", target_date: str, change_type:
 
     return rgb, index_img
 
-
 def _run_change_detection(payload: ChangeRequest) -> dict:
     geometry = ee.Geometry.Polygon([payload.aoi])
 
@@ -229,8 +176,7 @@ def _run_change_detection(payload: ChangeRequest) -> dict:
     if area_km2 > MAX_AOI_AREA_KM2:
         raise HTTPException(
             status_code=400,
-            detail=f"Selected area is {area_km2:,.0f} km² — please zoom in to under "
-                   f"{MAX_AOI_AREA_KM2:,} km² so the analysis stays fast and accurate.",
+            detail=f"Selected area is {area_km2:,.0f} km² — please restrict to under {MAX_AOI_AREA_KM2:,} km².",
         )
 
     cfg = INDEX_CONFIG[payload.changeType]
@@ -243,11 +189,9 @@ def _run_change_detection(payload: ChangeRequest) -> dict:
     change_mask = diff.abs().gt(threshold)
     masked_diff = diff.updateMask(change_mask)
 
-    # Red = decrease in the index, green = increase. Pixels below the
-    # threshold stay masked -> transparent in the PNG, so the overlay only
-    # highlights meaningful change.
+    # Bright Red (#EF4444) for loss/decrease, Bright Green (#22C55E) for gain/increase
     overlay = masked_diff.visualize(
-        min=-0.6, max=0.6, palette=["b91c1c", "f3f4f6", "16a34a"]
+        min=-0.6, max=0.6, palette=["ef4444", "00000000", "22c55e"]
     )
 
     rgb_vis = {"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000, "gamma": 1.2}
@@ -285,10 +229,21 @@ def _run_change_detection(payload: ChangeRequest) -> dict:
     b64_after = _dl(url_after)
     b64_overlay = _dl(url_overlay)
 
-    increase_ha = (stats.get("increase_m2") or 0) / 10_000
-    decrease_ha = (stats.get("decrease_m2") or 0) / 10_000
-    total_ha = (stats.get("total_m2") or 0) / 10_000
-    percent_changed = ((increase_ha + decrease_ha) / total_ha * 100) if total_ha else 0
+    # Measurements
+    total_m2 = stats.get("total_m2") or 0
+    increase_m2 = stats.get("increase_m2") or 0
+    decrease_m2 = stats.get("decrease_m2") or 0
+
+    total_ha = total_m2 / 10_000
+    increase_ha = increase_m2 / 10_000
+    decrease_ha = decrease_m2 / 10_000
+
+    total_km2 = total_m2 / 1_000_000
+    increase_km2 = increase_m2 / 1_000_000
+    decrease_km2 = decrease_m2 / 1_000_000
+
+    changed_m2 = increase_m2 + decrease_m2
+    percent_changed = (changed_m2 / total_m2 * 100) if total_m2 else 0
 
     return {
         "status": "success",
@@ -298,6 +253,9 @@ def _run_change_detection(payload: ChangeRequest) -> dict:
         "imgAfter": f"data:image/png;base64,{b64_after}",
         "changeOverlay": f"data:image/png;base64,{b64_overlay}",
         "stats": {
+            "totalAreaKm2": round(total_km2, 3),
+            "increaseKm2": round(increase_km2, 3),
+            "decreaseKm2": round(decrease_km2, 3),
             "totalAreaHa": round(total_ha, 1),
             "increaseHa": round(increase_ha, 1),
             "decreaseHa": round(decrease_ha, 1),
@@ -305,9 +263,106 @@ def _run_change_detection(payload: ChangeRequest) -> dict:
         },
     }
 
+# ------------------------------------------------------------------
+# 4. PDF Generation Helper
+# ------------------------------------------------------------------
+def _build_pdf_report(data: ReportRequest) -> bytes:
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Header
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(17, 24, 39)
+    pdf.cell(0, 10, "Satellite Pixel Change Detection Report", ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(107, 114, 128)
+    pdf.cell(0, 6, f"Generated on {time.strftime('%Y-%m-%d %H:%M:%S')} UTC | Region: Haryana, India", ln=True)
+    pdf.ln(4)
+
+    # Metadata & Parameters Box
+    pdf.set_fill_color(243, 244, 246)
+    pdf.rect(10, pdf.get_y(), 190, 22, "F")
+    pdf.set_xy(12, pdf.get_y() + 2)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(31, 41, 55)
+    pdf.cell(45, 6, f"Mode: {data.changeType.capitalize()}")
+    pdf.cell(65, 6, f"Baseline Date: {data.startDate}")
+    pdf.cell(65, 6, f"Comparison Date: {data.endDate}", ln=True)
+
+    pdf.set_x(12)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Metric: {data.indexLabel}", ln=True)
+    pdf.ln(8)
+
+    # Statistics Section
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(17, 24, 39)
+    pdf.cell(0, 8, "Quantitative Change Summary", ln=True)
+
+    stats = data.stats
+    pdf.set_font("Helvetica", "", 10)
+    col_w = 47.5
+    h = 9
+    pdf.set_fill_color(229, 231, 235)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(col_w, h, "Metric", border=1, fill=True)
+    pdf.cell(col_w, h, "Square Kilometers", border=1, fill=True)
+    pdf.cell(col_w, h, "Hectares", border=1, fill=True)
+    pdf.cell(col_w, h, "Relative %", border=1, fill=True, ln=True)
+
+    pdf.set_font("Helvetica", "", 9)
+    rows = [
+        ("Total AOI Area", f"{stats.get('totalAreaKm2', 0):,} km2", f"{stats.get('totalAreaHa', 0):,} ha", "100.0%"),
+        ("Net Increase (Gain)", f"{stats.get('increaseKm2', 0):,} km2", f"{stats.get('increaseHa', 0):,} ha", f"{round((stats.get('increaseKm2', 0) / max(stats.get('totalAreaKm2', 1), 1e-6)) * 100, 2)}%"),
+        ("Net Decrease (Loss)", f"{stats.get('decreaseKm2', 0):,} km2", f"{stats.get('decreaseHa', 0):,} ha", f"{round((stats.get('decreaseKm2', 0) / max(stats.get('totalAreaKm2', 1), 1e-6)) * 100, 2)}%"),
+        ("Total Changed Area", f"{round(stats.get('increaseKm2', 0) + stats.get('decreaseKm2', 0), 3):,} km2", f"{round(stats.get('increaseHa', 0) + stats.get('decreaseHa', 0), 1):,} ha", f"{stats.get('percentChanged', 0)}%"),
+    ]
+
+    for label, km2_val, ha_val, pct_val in rows:
+        pdf.cell(col_w, h, label, border=1)
+        pdf.cell(col_w, h, km2_val, border=1)
+        pdf.cell(col_w, h, ha_val, border=1)
+        pdf.cell(col_w, h, pct_val, border=1, ln=True)
+
+    pdf.ln(8)
+
+    # Save images to temp files and append them to PDF
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "Visual Change Evidence", ln=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        p_before = os.path.join(td, "before.png")
+        p_after = os.path.join(td, "after.png")
+        p_diff = os.path.join(td, "diff.png")
+
+        with open(p_before, "wb") as f:
+            f.write(base64.b64decode(data.imgBefore.split(",")[1]))
+        with open(p_after, "wb") as f:
+            f.write(base64.b64decode(data.imgAfter.split(",")[1]))
+        with open(p_diff, "wb") as f:
+            f.write(base64.b64decode(data.changeOverlay.split(",")[1]))
+
+        y = pdf.get_y()
+        img_w = 60
+        pdf.image(p_before, x=10, y=y, w=img_w)
+        pdf.image(p_after, x=75, y=y, w=img_w)
+        pdf.image(p_diff, x=140, y=y, w=img_w)
+
+        pdf.set_y(y + 62)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_x(10)
+        pdf.cell(img_w, 5, "Baseline (Before)", align="C")
+        pdf.set_x(75)
+        pdf.cell(img_w, 5, "Comparison (After)", align="C")
+        pdf.set_x(140)
+        pdf.cell(img_w, 5, "Red=Loss / Green=Gain", align="C")
+
+    return bytes(pdf.output())
 
 # ------------------------------------------------------------------
-# 4. Endpoint
+# 5. API Endpoints
 # ------------------------------------------------------------------
 @app.post("/api/change-detection")
 async def change_detection(payload: ChangeRequest):
@@ -317,9 +372,6 @@ async def change_detection(payload: ChangeRequest):
         return cached[1]
 
     try:
-        # ee's Python client is synchronous / blocking network I/O — run it
-        # off the event loop so one slow request doesn't stall every other
-        # visitor to the dashboard.
         result = await asyncio.to_thread(_run_change_detection, payload)
     except HTTPException:
         raise
@@ -329,26 +381,30 @@ async def change_detection(payload: ChangeRequest):
     _cache[key] = (time.time(), result)
     return result
 
+@app.post("/api/download-report")
+async def download_report(payload: ReportRequest):
+    try:
+        pdf_bytes = await asyncio.to_thread(_build_pdf_report, payload)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=haryana_change_report_{int(time.time())}.pdf"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "project": GEE_PROJECT_ID}
 
-
-# Serve the dashboard from this same app so the whole thing is one
-# deployable service with one URL — handy for demos. Put index.html next
-# to this file (see deployment notes).
 _FRONTEND_PATH = Path(__file__).parent / "index.html"
-
 
 @app.get("/")
 async def serve_dashboard():
     if _FRONTEND_PATH.exists():
         return FileResponse(_FRONTEND_PATH)
-    return {"detail": "index.html not found next to main.py — see deployment notes."}
-
+    return {"detail": "index.html not found next to main.py"}
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting FastAPI Server on http://localhost:8000 ...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
