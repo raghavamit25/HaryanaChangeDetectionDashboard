@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Groundwatch — Satellite Change Monitor</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #0A0E14;
+    --panel: #121826;
+    --panel-alt: #0D1220;
+    --line: #212B3D;
+    --text: #E7EBF3;
+    --muted: #8592A8;
+    --faint: #4C5771;
+    --signal: #38BDF8;
+    --growth: #2FD180;
+    --loss: #E8543F;
+    --radius: 8px;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Space Grotesk', sans-serif;
+    overflow:hidden;
+  }
+  .mono{ font-family:'IBM Plex Mono', monospace; letter-spacing:0.01em; }
+
+  .app{
+    display:grid;
+    grid-template-columns: 320px 1fr;
+    height:100vh;
+  }
+
+  /* ---------- Sidebar ---------- */
+  .sidebar{
+    background:var(--panel);
+    border-right:1px solid var(--line);
+    padding:22px 20px;
+    overflow-y:auto;
+    display:flex;
+    flex-direction:column;
+    gap:22px;
+  }
+  .brand{ display:flex; flex-direction:column; gap:4px; }
+  .brand .mark{
+    display:flex; align-items:center; gap:9px;
+    font-size:17px; font-weight:700;
+  }
+  .brand .dot{
+    width:9px; height:9px; border-radius:50%;
+    background:var(--growth);
+    box-shadow:0 0 8px var(--growth);
+  }
+  .brand p{
+    margin:0; font-size:12.5px; color:var(--muted); line-height:1.5;
+  }
+
+  .field-group{ display:flex; flex-direction:column; gap:9px; }
+  .field-label{
+    font-size:11.5px; color:var(--muted); font-weight:500;
+  }
+  .hint{ font-size:12px; color:var(--faint); line-height:1.5; margin:0; }
+
+  button.tool-btn{
+    background:var(--panel-alt);
+    border:1px solid var(--line);
+    color:var(--text);
+    padding:9px 12px;
+    border-radius:6px;
+    font-family:inherit;
+    font-size:13px;
+    cursor:pointer;
+    transition:border-color .15s ease;
+  }
+  button.tool-btn:hover{ border-color:var(--signal); }
+  button.tool-btn:disabled{ opacity:0.4; cursor:not-allowed; }
+
+  .aoi-status{
+    display:flex; align-items:center; gap:8px;
+    font-size:12.5px; color:var(--muted);
+  }
+  .aoi-status .chip{
+    width:7px; height:7px; border-radius:50%; background:var(--faint);
+  }
+  .aoi-status.ready .chip{ background:var(--growth); box-shadow:0 0 6px var(--growth); }
+  .aoi-status.ready{ color:var(--text); }
+
+  input[type="date"]{
+    background:var(--panel-alt);
+    border:1px solid var(--line);
+    color:var(--text);
+    padding:9px 10px;
+    border-radius:6px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:13px;
+    width:100%;
+  }
+  input[type="date"]::-webkit-calendar-picker-indicator{ filter:invert(0.7); }
+
+  .segmented{
+    display:flex;
+    border:1px solid var(--line);
+    border-radius:7px;
+    overflow:hidden;
+  }
+  .segmented button{
+    flex:1;
+    background:var(--panel-alt);
+    border:none;
+    border-right:1px solid var(--line);
+    color:var(--muted);
+    padding:9px 6px;
+    font-family:inherit;
+    font-size:12px;
+    cursor:pointer;
+  }
+  .segmented button:last-child{ border-right:none; }
+  .segmented button.active{
+    background:rgba(56,189,248,0.12);
+    color:var(--signal);
+  }
+
+  .run-btn{
+    background:var(--signal);
+    color:#031018;
+    border:none;
+    border-radius:7px;
+    padding:12px;
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:600;
+    font-size:14px;
+    cursor:pointer;
+  }
+  .run-btn:disabled{ background:var(--faint); color:var(--panel); cursor:not-allowed; }
+
+  .status-line{
+    font-size:12.5px;
+    color:var(--muted);
+    min-height:18px;
+    line-height:1.5;
+  }
+  .status-line.err{ color:var(--loss); }
+
+  .spinner{
+    width:13px; height:13px;
+    border:2px solid var(--line);
+    border-top-color:var(--signal);
+    border-radius:50%;
+    display:inline-block;
+    vertical-align:-2px;
+    margin-right:6px;
+    animation:spin .7s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  .divider{ height:1px; background:var(--line); }
+
+  .legend{ display:flex; flex-direction:column; gap:7px; font-size:12px; color:var(--muted); }
+  .legend .row{ display:flex; align-items:center; gap:8px; }
+  .legend .swatch{ width:11px; height:11px; border-radius:3px; }
+
+  /* ---------- Main column ---------- */
+  .main{
+    display:grid;
+    grid-template-rows: 1fr auto;
+    min-width:0;
+  }
+  #map{ width:100%; height:100%; min-height:420px; background:#0D1220; }
+  #mapError{
+    display:none; height:100%; align-items:center; justify-content:center;
+    text-align:center; color:var(--muted); font-size:13px; padding:30px;
+  }
+
+  .results{
+    background:var(--panel);
+    border-top:1px solid var(--line);
+    max-height:0;
+    overflow:hidden;
+    transition:max-height .35s ease;
+  }
+  .results.open{ max-height:340px; }
+  .results-inner{
+    display:grid;
+    grid-template-columns: 1fr 220px;
+    gap:18px;
+    padding:18px 22px;
+  }
+
+  .compare-wrap{
+    position:relative;
+    border-radius:var(--radius);
+    overflow:hidden;
+    border:1px solid var(--line);
+    background:#000;
+    height:280px;
+  }
+  .compare-wrap img{
+    position:absolute; top:0; left:0;
+    width:100%; height:100%;
+    object-fit:cover;
+    user-select:none; pointer-events:none;
+  }
+  #imgAfterClip{ clip-path: inset(0 0 0 50%); }
+  #imgOverlay{ opacity:0; transition:opacity .2s ease; mix-blend-mode:normal; }
+  .compare-slider{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    -webkit-appearance:none; appearance:none;
+    background:transparent;
+    margin:0; z-index:5;
+  }
+  .compare-slider::-webkit-slider-thumb{
+    -webkit-appearance:none;
+    width:3px; height:280px;
+    background:var(--signal);
+    box-shadow:0 0 10px rgba(56,189,248,0.7);
+    cursor:ew-resize;
+  }
+  .tag{
+    position:absolute; top:8px;
+    font-size:10.5px; font-family:'IBM Plex Mono', monospace;
+    background:rgba(0,0,0,0.55); color:var(--text);
+    padding:3px 8px; border-radius:4px; z-index:4;
+  }
+  .tag.before{ left:8px; } .tag.after{ right:8px; }
+
+  .overlay-toggle{
+    position:absolute; bottom:8px; left:8px; z-index:6;
+    display:flex; align-items:center; gap:6px;
+    font-size:11.5px; color:var(--text);
+    background:rgba(0,0,0,0.55);
+    padding:5px 9px; border-radius:5px;
+  }
+
+  .stats{ display:flex; flex-direction:column; gap:10px; justify-content:center; }
+  .stat-tile{
+    border:1px solid var(--line); border-radius:6px;
+    padding:9px 11px; background:var(--panel-alt);
+  }
+  .stat-tile .label{ font-size:10.5px; color:var(--muted); }
+  .stat-tile .value{ font-family:'IBM Plex Mono', monospace; font-size:18px; margin-top:2px; }
+  .stat-tile.growth .value{ color:var(--growth); }
+  .stat-tile.loss .value{ color:var(--loss); }
+
+  /* Leaflet control theming */
+  .leaflet-bar a{ background:var(--panel-alt) !important; color:var(--text) !important; border-color:var(--line) !important; }
+  .leaflet-draw-toolbar a{ background-color:var(--panel-alt) !important; }
+
+  @media (max-width: 800px){
+    .app{ grid-template-columns:1fr; grid-template-rows:auto 1fr auto; }
+    .sidebar{ border-right:none; border-bottom:1px solid var(--line); max-height:40vh; }
+    .results-inner{ grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= Sidebar ================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="mark"><span class="dot"></span> Groundwatch</div>
+      <p>Draw an area on the map, pick two dates, and see what changed on the ground between them — powered by Sentinel-2 and Earth Engine.</p>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="field-group">
+      <div class="field-label">1 — Area of interest</div>
+      <button class="tool-btn" id="drawBtn">Draw area on map</button>
+      <div class="aoi-status" id="aoiStatus"><span class="chip"></span><span>No area selected yet</span></div>
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">2 — Before date</div>
+      <input type="date" id="startDate" />
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">3 — After date</div>
+      <input type="date" id="endDate" />
+    </div>
+
+    <div class="field-group">
+      <div class="field-label">4 — What to detect</div>
+      <div class="segmented" id="changeType">
+        <button class="active" data-value="urban">Urban growth</button>
+        <button data-value="vegetation">Vegetation</button>
+        <button data-value="water">Water</button>
+      </div>
+    </div>
+
+    <button class="run-btn" id="runBtn" disabled>Run change detection</button>
+    <div class="status-line" id="statusLine">Draw an area and choose two dates to begin.</div>
+
+    <div class="divider"></div>
+
+    <div class="legend">
+      <div class="field-label">Reading the overlay</div>
+      <div class="row"><span class="swatch" style="background:var(--growth)"></span> Increase in selected index</div>
+      <div class="row"><span class="swatch" style="background:var(--loss)"></span> Decrease in selected index</div>
+      <div class="row"><span class="swatch" style="background:transparent;border:1px dashed var(--faint)"></span> No meaningful change</div>
+    </div>
+  </aside>
+
+  <!-- ================= Main ================= -->
+  <div class="main">
+    <div id="map"></div>
+    <div id="mapError">Map library couldn't load. This page needs network access to cdnjs.cloudflare.com and the map tile servers — try opening this file directly in your browser instead of a restricted preview.</div>
+
+    <div class="results" id="results">
+      <div class="results-inner">
+        <div class="compare-wrap" id="compareWrap">
+          <span class="tag before">BEFORE</span>
+          <span class="tag after">AFTER</span>
+          <img id="imgBefore" src="" alt="Before" />
+          <img id="imgAfterClip" src="" alt="After" />
+          <img id="imgOverlay" src="" alt="Change overlay" />
+          <input type="range" class="compare-slider" id="slider" min="0" max="100" value="50" />
+          <label class="overlay-toggle"><input type="checkbox" id="overlayToggle" /> Show change overlay</label>
+        </div>
+        <div class="stats" id="statsPanel">
+          <div class="stat-tile"><div class="label">AREA ANALYZED</div><div class="value" id="statTotal">—</div></div>
+          <div class="stat-tile growth"><div class="label">INCREASED</div><div class="value" id="statGrowth">—</div></div>
+          <div class="stat-tile loss"><div class="label">DECREASED</div><div class="value" id="statLoss">—</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+// ---------------------------------------------------------------
+// Leave this empty if this file is served BY the FastAPI app itself
+// (the "/" route in main.py does this — one URL, one deploy).
+// If you're serving this HTML separately from the backend, set this to
+// your backend's full URL, e.g. "https://your-app.onrender.com".
+// ---------------------------------------------------------------
+const API_BASE_URL = "";
+
+// ---------------- Map setup ----------------
+// If Leaflet failed to load (blocked network, offline, etc.) show a
+// message instead of a silent blank box.
+if (typeof L === 'undefined') {
+  document.getElementById('map').style.display = 'none';
+  document.getElementById('mapError').style.display = 'flex';
+  throw new Error('Leaflet failed to load from cdnjs.cloudflare.com');
+}
+
+const map = L.map('map', { zoomControl: true }).setView([28.7, 76.8], 8); // default: Haryana, India
+
+const satelliteLayer = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { attribution: 'Imagery &copy; Esri', maxZoom: 19 }
+);
+const streetsLayer = L.tileLayer(
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }
+);
+
+satelliteLayer.addTo(map);
+L.control.layers({ 'Satellite': satelliteLayer, 'Streets': streetsLayer }, null, { position: 'topright' }).addTo(map);
+
+// Some hosting/preview contexts don't report the container's final size
+// until after Leaflet has already measured it, which makes the map look
+// blank or half-rendered. Re-measure a couple of times to be safe.
+setTimeout(() => map.invalidateSize(), 150);
+window.addEventListener('resize', () => map.invalidateSize());
+
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+const drawControl = new L.Control.Draw({
+  draw: {
+    polygon: { shapeOptions: { color: '#38BDF8', weight: 2 } },
+    marker: false, circle: false, circlemarker: false, polyline: false, rectangle: true
+  },
+  edit: { featureGroup: drawnItems, remove: true }
+});
+map.addControl(drawControl);
+
+let currentAOI = null; // array of [lng, lat] pairs, closed ring
+
+function setAOIFromLayer(layer) {
+  drawnItems.clearLayers();
+  drawnItems.addLayer(layer);
+  const latlngs = layer.getLatLngs()[0];
+  const ring = latlngs.map(p => [p.lng, p.lat]);
+  ring.push(ring[0]); // close the ring
+  currentAOI = ring;
+  document.getElementById('aoiStatus').classList.add('ready');
+  document.getElementById('aoiStatus').innerHTML = '<span class="chip"></span><span>Area selected — ' + latlngs.length + ' vertices</span>';
+  updateRunButton();
+}
+
+map.on(L.Draw.Event.CREATED, (e) => setAOIFromLayer(e.layer));
+
+document.getElementById('drawBtn').addEventListener('click', () => {
+  new L.Draw.Polygon(map, drawControl.options.draw.polygon).enable();
+});
+
+// ---------------- Controls ----------------
+let changeType = 'urban';
+document.querySelectorAll('#changeType button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#changeType button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    changeType = btn.dataset.value;
+  });
+});
+
+const startInput = document.getElementById('startDate');
+const endInput = document.getElementById('endDate');
+[startInput, endInput].forEach(el => el.addEventListener('change', updateRunButton));
+
+function updateRunButton() {
+  const ready = currentAOI && startInput.value && endInput.value;
+  document.getElementById('runBtn').disabled = !ready;
+}
+
+// ---------------- Run analysis ----------------
+const statusLine = document.getElementById('statusLine');
+const runBtn = document.getElementById('runBtn');
+
+runBtn.addEventListener('click', async () => {
+  runBtn.disabled = true;
+  statusLine.classList.remove('err');
+  statusLine.innerHTML = '<span class="spinner"></span> Fetching Sentinel-2 imagery and running change detection…';
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/change-detection`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        aoi: currentAOI,
+        startDate: startInput.value,
+        endDate: endInput.value,
+        changeType: changeType
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+
+    renderResults(data);
+    statusLine.textContent = `Done — showing ${data.indexLabel} change between the two dates.`;
+  } catch (err) {
+    statusLine.classList.add('err');
+    statusLine.textContent = 'Could not complete analysis: ' + err.message;
+  } finally {
+    updateRunButton();
+  }
+});
+
+function renderResults(data) {
+  document.getElementById('imgBefore').src = data.imgBefore;
+  document.getElementById('imgAfterClip').src = data.imgAfter;
+  document.getElementById('imgOverlay').src = data.changeOverlay;
+
+  document.getElementById('statTotal').textContent = data.stats.totalAreaHa.toLocaleString() + ' ha';
+  document.getElementById('statGrowth').textContent = data.stats.increaseHa.toLocaleString() + ' ha';
+  document.getElementById('statLoss').textContent = data.stats.decreaseHa.toLocaleString() + ' ha';
+
+  document.getElementById('results').classList.add('open');
+}
+
+// Before/after compare slider
+document.getElementById('slider').addEventListener('input', (e) => {
+  document.getElementById('imgAfterClip').style.clipPath = `inset(0 0 0 ${e.target.value}%)`;
+});
+
+// Change overlay toggle
+document.getElementById('overlayToggle').addEventListener('change', (e) => {
+  document.getElementById('imgOverlay').style.opacity = e.target.checked ? '0.9' : '0';
+});
+</script>
+</body>
+</html>
