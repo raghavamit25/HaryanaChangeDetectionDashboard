@@ -51,6 +51,7 @@ except ImportError:
 
 import ee
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 
 # ------------------------------------------------------------------
 # 1. Earth Engine auth — service account, NOT interactive
@@ -74,34 +75,52 @@ GEE_PROJECT_ID = os.environ.get("GEE_PROJECT_ID", "change-detection-haryana")
 
 def _init_earth_engine():
     project_id = os.environ.get("GEE_PROJECT", "change-detection-haryana")
-    creds_json = os.environ.get("GEE_CREDENTIALS_JSON")
+    creds_raw = os.environ.get("GEE_CREDENTIALS_JSON")
 
-    if creds_json:
+    if not creds_raw:
         try:
-            info = json.loads(creds_json)
+            ee.Initialize(project=project_id)
+            print("Earth Engine initialized via default local credentials.")
+            return
+        except Exception as exc:
+            raise RuntimeError("GEE_CREDENTIALS_JSON environment variable is missing.") from exc
+
+    try:
+        info = json.loads(creds_raw)
+
+        # Format 1: User Refresh Token (from earthengine authenticate)
+        if "refresh_token" in info:
+            # Default Earth Engine client credentials if omitted from local credentials file
+            client_id = info.get("client_id", "517222506229-vsmgvv0qigbdahqm532kb7b7v8ea1125.apps.googleusercontent.com")
+            client_secret = info.get("client_secret", "")
+
             credentials = Credentials(
                 None,
                 refresh_token=info["refresh_token"],
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=info["client_id"],
-                client_secret=info["client_secret"],
+                token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
+                client_id=client_id,
+                client_secret=client_secret,
                 scopes=["https://www.googleapis.com/auth/earthengine"]
             )
             ee.Initialize(credentials=credentials, project=project_id)
-            print("Earth Engine initialized successfully via GEE_CREDENTIALS_JSON.")
+            print("Earth Engine initialized successfully via Refresh Token.")
             return
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize Earth Engine with GEE_CREDENTIALS_JSON: {e}")
 
-    # Fallback for local machine testing
-    try:
-        ee.Initialize(project=project_id)
-        print("Earth Engine initialized via default credentials.")
-    except Exception as exc:
-        raise RuntimeError(
-            "Earth Engine auth failed. GEE_CREDENTIALS_JSON is missing or invalid."
-        ) from exc
+        # Format 2: Service Account JSON
+        elif "private_key" in info and "client_email" in info:
+            credentials = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=["https://www.googleapis.com/auth/earthengine"]
+            )
+            ee.Initialize(credentials=credentials, project=project_id)
+            print("Earth Engine initialized successfully via Service Account.")
+            return
 
+        else:
+            raise ValueError(f"Unrecognized JSON structure. Keys present: {list(info.keys())}")
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Earth Engine with GEE_CREDENTIALS_JSON: {e}")
 
 _init_earth_engine()
 
